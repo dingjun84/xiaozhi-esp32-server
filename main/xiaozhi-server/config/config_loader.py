@@ -72,6 +72,7 @@ async def get_config_from_api_async(config):
     if config.get("server"):
         config_data["server"] = {
             "ip": config["server"].get("ip", ""),
+            "local_ip": config["server"].get("local_ip", ""),
             "port": config["server"].get("port", ""),
             "http_port": config["server"].get("http_port", ""),
             "vision_explain": config["server"].get("vision_explain", ""),

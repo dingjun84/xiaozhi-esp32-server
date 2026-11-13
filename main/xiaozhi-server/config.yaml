@@ -9,6 +9,10 @@
 server:
   # 服务器监听地址和端口(Server listening address and port)
   ip: 0.0.0.0
+  # 对外地址自动生成时优先使用此 IPv4 地址；留空则通过外网路由探测。
+  # 本机数字人可填 127.0.0.1，其他设备连接请填服务端的局域网 IP。
+  # 不改变监听地址；显式配置的 websocket、vision_explain 完整 URL 仍优先。
+  local_ip: ""
   port: 8000
   # http服务的端口，用于简单OTA接口(单服务部署)，以及视觉分析接口
   http_port: 8003

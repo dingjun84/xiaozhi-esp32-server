@@ -7,6 +7,9 @@
 # 打开本data目录下的.config.yaml文件，修改manager-api.secret为刚才复制出来的server.secret
 server:
   ip: 0.0.0.0
+  # 地址自动生成时优先使用此 IPv4 地址；留空则自动探测，不改变监听地址。
+  # 本机使用填 127.0.0.1，其他设备连接请填服务端的局域网 IP。
+  local_ip: ""
   port: 8000
   # http服务的端口，用于视觉分析接口
   http_port: 8003

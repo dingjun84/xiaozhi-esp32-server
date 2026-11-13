@@ -4,6 +4,7 @@ import json
 import copy
 import wave
 import socket
+from ipaddress import IPv4Address
 import sys
 import asyncio
 import threading
@@ -65,15 +66,25 @@ def _ffmpeg_path_override():
 ffmpeg_path_override = _ffmpeg_path_override
 
 
-def get_local_ip():
+def get_local_ip(config=None):
+    """优先使用 server.local_ip，否则探测外网路由使用的 IPv4 地址。"""
+    configured_ip = (config or {}).get("server", {}).get("local_ip")
+    if configured_ip is not None and str(configured_ip).strip():
+        configured_ip = str(configured_ip).strip()
+        try:
+            address = IPv4Address(configured_ip)
+        except ValueError as exc:
+            raise ValueError("server.local_ip 必须是有效的 IPv4 地址") from exc
+        if address.is_unspecified or address.is_multicast:
+            raise ValueError("server.local_ip 必须是客户端可访问的 IPv4 地址，不能是通配或组播地址")
+        return str(address)
+
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Connect to Google's DNS servers
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        return local_ip
-    except Exception as e:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # 通过路由选择获取源 IP，不发送 UDP 数据。
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
         return "127.0.0.1"
 
 
@@ -603,7 +614,7 @@ def get_vision_url(config: dict) -> str:
     server_config = config["server"]
     vision_explain = server_config.get("vision_explain", "")
     if "你的" in vision_explain:
-        local_ip = get_local_ip()
+        local_ip = get_local_ip(config)
         port = int(server_config.get("http_port", 8003))
         vision_explain = f"http://{local_ip}:{port}/mcp/vision/explain"
     return vision_explain
