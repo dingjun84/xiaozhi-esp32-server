@@ -24,6 +24,7 @@ class AudioRateController:
         # 流控间隔（毫秒）：send_delay > 0 时用配置值，否则用 frame_duration
         self.interval_ms = send_delay if send_delay > 0 else frame_duration
         self.queue = deque()
+        self.queue_observer = None
         self.play_position = 0  # 虚拟播放位置（毫秒）
         self.start_timestamp = None  # 开始时间戳（只读，不修改）
         self.pending_send_task = None
@@ -61,7 +62,7 @@ class AudioRateController:
                     f"队列从空恢复，重置时间戳，当前播放位置: {self.play_position}ms，间隔: {elapsed_since_empty:.0f}ms"
                 )
 
-        self.queue.append(("audio", opus_packet))
+        self.queue.append(("audio", opus_packet, time.monotonic()))
         # 相关事件处理
         self.queue_empty_event.clear()
         self.queue_has_data_event.set()
@@ -117,7 +118,7 @@ class AudioRateController:
                 if self.start_timestamp is None:
                     self.start_timestamp = time.monotonic()
 
-                _, opus_packet = item
+                _, opus_packet, queued_at = item
 
                 # 循环等待直到时间到达
                 while True:
@@ -142,6 +143,8 @@ class AudioRateController:
 
                 # 时间已到，从队列移除并发送
                 self.queue.popleft()
+                if self.queue_observer:
+                    self.queue_observer(time.monotonic() - queued_at)
                 self.play_position += self.interval_ms
                 try:
                     await send_audio_callback(opus_packet)

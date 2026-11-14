@@ -40,6 +40,9 @@ class ListenTextMessageHandler(TextMessageHandler):
             if conn.asr is None:
                 return
 
+            trace = getattr(conn, "_input_trace", None)
+            if trace:
+                trace.mark("client.listen_stop")
             conn.client_voice_stop = True
             if conn.asr.interface_type == InterfaceType.STREAM:
                 # 流式模式下，发送结束请求

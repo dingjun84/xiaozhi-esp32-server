@@ -1,3 +1,4 @@
+from core.utils.latency import new_trace
 import json
 import hmac
 import base64
@@ -5,7 +6,7 @@ import hashlib
 import asyncio
 import websockets
 import gc
-from time import mktime
+from time import mktime, monotonic
 from datetime import datetime
 from urllib.parse import urlencode
 from typing import List, TYPE_CHECKING
@@ -36,6 +37,7 @@ class ASRProvider(ASRProviderBase):
         self.forward_task = None
         self.is_processing = False
         self.server_ready = False
+        self._diagnostic_trace = None
 
         # 讯飞配置
         self.app_id = config.get("app_id")
@@ -108,6 +110,9 @@ class ASRProvider(ASRProviderBase):
                 await self._start_recognition(conn)
             except Exception as e:
                 logger.bind(tag=TAG).error(f"建立ASR连接失败: {str(e)}")
+                if self._diagnostic_trace:
+                    self._diagnostic_trace.error("asr.connect", e)
+                    self._diagnostic_trace.finish("asr_error")
                 await self._cleanup()
                 return
 
@@ -123,9 +128,14 @@ class ASRProvider(ASRProviderBase):
         """开始识别会话"""
         try:
             self.is_processing = True
+            self._diagnostic_trace = getattr(conn, "_input_trace", None) or new_trace(conn, "audio")
+            conn._input_trace = self._diagnostic_trace
+            trace = self._diagnostic_trace
+            connect_started = monotonic()
+            trace.mark("asr.connect.start")
             # 建立WebSocket连接
             ws_url = self.create_url()
-            logger.bind(tag=TAG).info(f"正在连接ASR服务: {ws_url[:50]}...")
+            logger.bind(tag=TAG).info("正在连接ASR服务: ws://iat.cn-huabei-1.xf-yun.com/v1")
 
             # 如果为手动模式,设置超时时长为一分钟
             if conn.client_listen_mode == "manual":
@@ -139,6 +149,8 @@ class ASRProvider(ASRProviderBase):
                 close_timeout=10,
             )
 
+            trace.observe("asr.connect", monotonic() - connect_started)
+            trace.mark("asr.connect.end")
             logger.bind(tag=TAG).info("ASR WebSocket连接已建立")
             self.server_ready = False
             self.forward_task = asyncio.create_task(self._forward_results(conn))
@@ -147,6 +159,7 @@ class ASRProvider(ASRProviderBase):
             if conn.asr_audio and len(conn.asr_audio) > 0:
                 first_pcm = conn.asr_audio[-1] if conn.asr_audio else b""
                 await self._send_audio_frame(first_pcm, STATUS_FIRST_FRAME)
+                trace.mark("asr.first_frame_sent")
                 self.server_ready = True
                 logger.bind(tag=TAG).info("已发送首帧，开始识别")
 
@@ -159,6 +172,8 @@ class ASRProvider(ASRProviderBase):
                         break
 
         except Exception as e:
+            if self._diagnostic_trace and "connect_started" in locals():
+                self._diagnostic_trace.observe("asr.connect", monotonic() - connect_started)
             logger.bind(tag=TAG).error(f"建立ASR连接失败: {str(e)}")
             if hasattr(e, "__cause__") and e.__cause__:
                 logger.bind(tag=TAG).error(f"错误原因: {str(e.__cause__)}")
@@ -183,15 +198,21 @@ class ASRProvider(ASRProviderBase):
             },
         }
 
+        started = monotonic()
         await self.asr_ws.send(json.dumps(frame_data, ensure_ascii=False))
+        if self._diagnostic_trace:
+            self._diagnostic_trace.observe("asr.audio_send", monotonic() - started)
 
     async def _forward_results(self, conn: "ConnectionHandler"):
         """转发识别结果"""
+        trace = self._diagnostic_trace
+        final_received = False
         try:
             while not conn.stop_event.is_set():
                 try:
                     response = await asyncio.wait_for(self.asr_ws.recv(), timeout=60)
                     result = json.loads(response)
+                    trace.mark("asr.first_result", once=True)
                     logger.bind(tag=TAG).debug(f"收到ASR结果: {result}")
 
                     header = result.get("header", {})
@@ -200,6 +221,8 @@ class ASRProvider(ASRProviderBase):
                     status = header.get("status", 0)
 
                     if code != 0:
+                        trace.mark("asr.provider_error", code=code)
+                        trace.error("asr.provider", RuntimeError())
                         logger.bind(tag=TAG).error(
                             f"识别错误，错误码: {code}, 消息: {header.get('message', '')}"
                         )
@@ -222,11 +245,17 @@ class ASRProvider(ASRProviderBase):
                                     self.text += w
 
                     if status == 2:
+                        final_received = True
+                        trace.mark("asr.final")
+                        started = trace.events.get("asr.first_frame_sent")
+                        if started is not None:
+                            trace.observe("asr.recognition_including_speech", monotonic() - started)
                         logger.bind(tag=TAG).debug("收到最终识别结果，触发处理")
                         await self.handle_voice_stop(conn, conn.asr_audio)
                         break
 
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as exc:
+                    trace.error("asr.receive", exc)
                     logger.bind(tag=TAG).error("接收结果超时")
                     break
                 except websockets.ConnectionClosed:
@@ -234,6 +263,7 @@ class ASRProvider(ASRProviderBase):
                     self.is_processing = False
                     break
                 except Exception as e:
+                    trace.error("asr.receive", e)
                     logger.bind(tag=TAG).error(f"处理ASR结果时发生错误: {str(e)}")
                     if hasattr(e, "__cause__") and e.__cause__:
                         logger.bind(tag=TAG).error(f"错误原因: {str(e.__cause__)}")
@@ -247,6 +277,10 @@ class ASRProvider(ASRProviderBase):
         finally:
             # 清理连接资源
             await self._cleanup()
+            if not final_received:
+                trace.finish("asr_incomplete")
+            if getattr(conn, "_input_trace", None) is trace:
+                conn._input_trace = None
             conn.reset_audio_states()
 
     async def handle_voice_stop(
@@ -260,7 +294,13 @@ class ASRProvider(ASRProviderBase):
                     await self._send_audio_frame(b"", STATUS_LAST_FRAME)
                     logger.bind(tag=TAG).debug(f"已发送停止请求")
 
-                    await asyncio.sleep(0.25)
+                    trace = self._diagnostic_trace
+                    if trace:
+                        trace.mark("asr.stop_frame_sent")
+                        with trace.span("asr.fixed_wait"):
+                            await asyncio.sleep(0.25)
+                    else:
+                        await asyncio.sleep(0.25)
                 except Exception as e:
                     logger.bind(tag=TAG).error(f"发送停止请求失败: {e}")
 
@@ -284,6 +324,8 @@ class ASRProvider(ASRProviderBase):
                 # 先停止音频发送
                 self.is_processing = False
                 await self._send_audio_frame(b"", STATUS_LAST_FRAME)
+                if self._diagnostic_trace:
+                    self._diagnostic_trace.mark("asr.client_stop_frame_sent")
                 logger.bind(tag=TAG).debug("已发送停止请求")
             except Exception as e:
                 logger.bind(tag=TAG).error(f"发送停止请求失败: {e}")

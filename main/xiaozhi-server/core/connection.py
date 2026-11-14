@@ -1,3 +1,4 @@
+from core.utils.latency import TimedQueue, new_trace, trace_for, finish_all, current_trace, current_request
 import os
 import sys
 import copy
@@ -157,7 +158,7 @@ class ConnectionHandler:
         # 因为实际部署时可能会用到公共的本地ASR，不能把变量暴露给公共ASR
         # 所以涉及到ASR的变量，需要在这里定义，属于connection的私有变量
         self.asr_audio = []  # 存储PCM帧列表，供VAD和ASR共享
-        self.asr_audio_queue = queue.Queue()
+        self.asr_audio_queue = TimedQueue(self._observe_audio_queue)
         self.current_speaker = None  # 存储当前说话人
         self.introduced_speakers = set()  # 已"首次引入"的说话人，控制只在首轮带名字
         self.system_introduced_speakers = set()  # 已在 system 注入过身份的说话人，控制 system 身份只首轮出现
@@ -345,6 +346,13 @@ class ConnectionHandler:
 
             asyncio.create_task(check_bind_device(self))
 
+    def _observe_audio_queue(self, item, elapsed):
+        self._audio_queue_wait = elapsed
+        self._audio_received_at = time.monotonic() - elapsed
+        trace = getattr(self, "_input_trace", None)
+        if trace:
+            trace.observe("audio.input_queue", elapsed)
+
     async def _route_message(self, message):
         """消息路由"""
         # 检查是否已经获取到真实的绑定状态
@@ -530,6 +538,17 @@ class ConnectionHandler:
             return pcm_frame
 
     def _decode_opus_packet(self, opus_packet: bytes) -> bytes:
+        started = time.monotonic()
+        try:
+            return self._decode_opus_packet_impl(opus_packet)
+        finally:
+            elapsed = time.monotonic() - started
+            self._last_decode_elapsed = elapsed
+            trace = getattr(self, "_input_trace", None)
+            if trace:
+                trace.observe("audio.decode", elapsed)
+
+    def _decode_opus_packet_impl(self, opus_packet: bytes) -> bytes:
         """
         解码Opus数据包为PCM数据
 
@@ -1052,7 +1071,23 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
-    def chat(self, query, depth=0):
+    def chat(self, query, depth=0, trace=None):
+        trace = trace or (new_trace(self) if depth == 0 else trace_for(self))
+        token = current_trace.set(trace)
+        request_token = current_request.set(depth + 1)
+        try:
+            return self._chat_traced(query, depth, trace)
+        except Exception as exc:
+            if trace:
+                trace.error("chat", exc)
+                trace.finish("error")
+            raise
+        finally:
+            current_request.reset(request_token)
+            current_trace.reset(token)
+
+    def _chat_traced(self, query, depth, trace):
+        llm_stage = f"llm.{depth + 1}"
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
         current_sentence_id = None
 
@@ -1061,7 +1096,11 @@ class ConnectionHandler:
 
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
-            current_sentence_id = str(uuid.uuid4().hex)
+            current_sentence_id = trace.id
+            trace.mark("chat.worker_start")
+            queued = trace.events.get("chat.queued")
+            if queued is not None:
+                trace.observe("chat.executor_queue", time.monotonic() - queued)
             self.sentence_id = current_sentence_id  # 更新共享属性
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
@@ -1073,7 +1112,7 @@ class ConnectionHandler:
             )
         else:
             # 递归调用时，使用当前的sentence_id
-            current_sentence_id = self.sentence_id
+            current_sentence_id = trace.id if trace else self.sentence_id
 
         # 设置最大递归深度，避免无限循环，可根据实际需求调整
         MAX_DEPTH = 5
@@ -1116,7 +1155,8 @@ class ConnectionHandler:
                 future = asyncio.run_coroutine_threadsafe(
                     self.memory.query_memory(query), self.loop
                 )
-                memory_str = future.result()
+                with trace.span("memory.query"):
+                    memory_str = future.result()
 
             # 仅在该说话人首次出现时把身份注入 system，之后靠对话历史首轮保留，
             # 避免每轮在 system 重复出现名字诱导模型反复称呼
@@ -1126,24 +1166,30 @@ class ConnectionHandler:
                 self.system_introduced_speakers.add(cs)
                 speaker_for_system = cs
 
+            with trace.span(llm_stage + ".context"):
+                llm_dialogue = self.dialogue.get_llm_dialogue_with_memory(
+                    memory_str, self.config.get("voiceprint", {}), speaker_for_system
+                )
+            request_id = f"{trace.id}:llm:{depth + 1}"
+            llm_started = time.monotonic()
+            trace.mark(llm_stage + ".request", request_id=request_id)
+            trace.io("llm.input", {"request_id": request_id, "messages": llm_dialogue, "tools": functions})
             if self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    llm_dialogue,
                     functions=functions,
                 )
             else:
                 llm_responses = self.llm.response(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    llm_dialogue,
                 )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
+            trace.error("llm.prepare", e)
+            trace.finish("error")
             return None
 
         # 处理流式响应
@@ -1152,8 +1198,11 @@ class ConnectionHandler:
         tool_calls_list = []  # 格式: [{"id": "", "name": "", "arguments": ""}]
         content_arguments = ""
         emotion_flag = True
+        first_effective = True
+        llm_output = []
         try:
             for response in llm_responses:
+                trace.mark(llm_stage + ".first_event", once=True)
                 if self.client_abort:
                     break
                 if self.intent_type == "function_call" and functions is not None:
@@ -1198,6 +1247,20 @@ class ConnectionHandler:
                 else:
                     content = response
 
+                if content:
+                    llm_output.append(content)
+                effective = bool(content) or (
+                    self.intent_type == "function_call" and functions is not None
+                    and tools_call and any(
+                        getattr(tc.function, "name", None) or getattr(tc.function, "arguments", None)
+                        for tc in tools_call
+                    )
+                )
+                if first_effective and effective:
+                    first_effective = False
+                    trace.observe(llm_stage + ".first_effective", time.monotonic() - llm_started)
+                    trace.mark(llm_stage + ".first_effective", request_id=request_id)
+
                 # 在llm回复中获取情绪表情，一轮对话只在开头获取一次
                 if emotion_flag and content is not None and content.strip():
                     if (self.features or {}).get("emoji", True):
@@ -1219,6 +1282,7 @@ class ConnectionHandler:
                             )
                         )
         except Exception as e:
+            trace.error(llm_stage, e)
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1237,6 +1301,10 @@ class ConnectionHandler:
                     )
                 )
             return
+        finally:
+            trace.observe(llm_stage + ".stream", time.monotonic() - llm_started)
+            trace.mark(llm_stage + ".end", aborted=self.client_abort)
+            trace.io("llm.output", {"request_id": request_id, "text": "".join(llm_output), "tool_calls": tool_calls_list})
         # 处理function call
         if tool_call_flag:
             bHasError = False
@@ -1336,9 +1404,7 @@ class ConnectionHandler:
                     enqueue_tool_report(self, tool_call_data['name'], tool_input)
 
                     future = asyncio.run_coroutine_threadsafe(
-                        self.func_handler.handle_llm_function_call(
-                            self, tool_call_data
-                        ),
+                        self._call_tool_traced(tool_call_data, trace, time.monotonic()),
                         self.loop,
                     )
                     futures_with_data.append((future, tool_call_data, tool_input))
@@ -1356,6 +1422,7 @@ class ConnectionHandler:
                         enqueue_tool_report(self, tool_call_data['name'], tool_input, str(result.result) if result.result else None, report_tool_call=False)
 
                     except Exception as e:
+                        trace.error("tool.wait", e)
                         self.logger.bind(tag=TAG).error(
                             f"工具调用超时或异常: {tool_call_data['name']}, 错误: {e}"
                         )
@@ -1369,7 +1436,7 @@ class ConnectionHandler:
 
                 # 统一处理工具调用结果
                 if tool_results:
-                    self._handle_function_result(tool_results, depth=depth, streamed_text=streamed_text)
+                    self._handle_function_result(tool_results, depth=depth, streamed_text=streamed_text, trace=trace)
 
         # 存储对话内容
         if len(response_message) > 0:
@@ -1394,7 +1461,18 @@ class ConnectionHandler:
 
         return True
 
-    def _handle_function_result(self, tool_results, depth, streamed_text=""):
+    async def _call_tool_traced(self, tool_call_data, trace, submitted=None):
+        stage = f"tool.{tool_call_data['name']}.{tool_call_data.get('id', '')}"
+        if submitted is not None:
+            trace.observe(stage + ".loop_dispatch", time.monotonic() - submitted)
+        trace.io("tool.input", tool_call_data)
+        with trace.span(stage):
+            result = await self.func_handler.handle_llm_function_call(self, tool_call_data)
+        trace.io("tool.output", {"id": tool_call_data.get("id"), "action": str(result.action),
+                                 "result": result.result, "response": result.response})
+        return result
+
+    def _handle_function_result(self, tool_results, depth, streamed_text="", trace=None):
         need_llm_tools = []
         record_tools = []
 
@@ -1500,7 +1578,7 @@ class ConnectionHandler:
                         )
                     )
 
-            self.chat(None, depth=depth + 1)
+            self.chat(None, depth=depth + 1, trace=trace)
 
     def _report_worker(self):
         """聊天记录上报工作线程"""
@@ -1542,6 +1620,7 @@ class ConnectionHandler:
 
     async def close(self, ws=None):
         """资源清理方法"""
+        finish_all(self, "disconnected")
         try:
             # 清理 VAD 连接资源
             if (

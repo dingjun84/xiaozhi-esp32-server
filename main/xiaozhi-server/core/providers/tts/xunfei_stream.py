@@ -1,3 +1,4 @@
+from core.utils.latency import trace_for
 import os
 import time
 import uuid
@@ -118,6 +119,7 @@ class TTSProvider(TTSProviderBase):
         self.ws = None
         self._monitor_task = None
         self.activate_session = False
+        self._diagnostic_trace = None
 
         # 序列号管理
         self.text_seq = 0
@@ -136,15 +138,24 @@ class TTSProvider(TTSProviderBase):
                 self.api_key, self.api_secret, self.api_url
             )
 
+            trace = self._diagnostic_trace
+            connect_started = time.monotonic()
+            if trace:
+                trace.mark("tts.connect.start")
             self.ws = await websockets.connect(
                 auth_url,
                 ping_interval=30,
                 ping_timeout=10,
                 close_timeout=10,
             )
+            if trace:
+                trace.observe("tts.connect", time.monotonic() - connect_started)
+                trace.mark("tts.connect.end")
             logger.bind(tag=TAG).debug("WebSocket连接建立成功")
             return self.ws
         except Exception as e:
+            if self._diagnostic_trace and "connect_started" in locals():
+                self._diagnostic_trace.observe("tts.connect", time.monotonic() - connect_started)
             logger.bind(tag=TAG).error(f"建立连接失败: {str(e)}")
             self.ws = None
             raise
@@ -168,6 +179,10 @@ class TTSProvider(TTSProviderBase):
                 )
 
                 if message.sentence_type == SentenceType.FIRST:
+                    self.current_sentence_id = message.sentence_id
+                    self._diagnostic_trace = trace_for(self.conn, message.sentence_id)
+                    if self._diagnostic_trace:
+                        self._diagnostic_trace.mark("tts.worker_start")
                     # 重置流式处理状态
                     self.reset_stream_state()
                     # 重置序列号
@@ -193,11 +208,15 @@ class TTSProvider(TTSProviderBase):
                                 f"开始发送TTS文本: {message.content_detail}"
                             )
                             future = asyncio.run_coroutine_threadsafe(
-                                self.text_to_speak(message.content_detail, None),
+                                self.text_to_speak(message.content_detail, time.monotonic()),
                                 loop=self.conn.loop,
                             )
                             future.result(timeout=self.tts_timeout)
                         except Exception as e:
+                            trace = trace_for(self.conn, message.sentence_id)
+                            if trace:
+                                trace.error("tts.text", e)
+                                trace.finish("tts_error")
                             logger.bind(tag=TAG).error(f"发送TTS文本失败: {str(e)}")
                             # 不使用continue，确保后续处理不被中断
 
@@ -243,15 +262,24 @@ class TTSProvider(TTSProviderBase):
     async def text_to_speak(self, text, _):
         """发送文本到TTS服务进行合成"""
         try:
+            trace = self._diagnostic_trace
+            if trace and isinstance(_, (int, float)):
+                trace.observe("tts.loop_dispatch", time.monotonic() - _)
+            clean_started = time.monotonic()
             filtered_text = MarkdownCleaner.clean_markdown(text)
 
             if filtered_text:
                 # 使用滑动窗口匹配处理跨分片的替换词
                 confirmed_texts, self._pending_prefix = self._match_stream_text(filtered_text)
                 confirmed_texts = [txt for txt in confirmed_texts if txt]
+                if trace:
+                    trace.observe("tts.text_prepare", time.monotonic() - clean_started)
                 if not confirmed_texts:
                     return
 
+                if trace:
+                    trace.mark("tts.first_text_ready", once=True)
+                    trace.io("tts.input", {"text": "".join(confirmed_texts), "fragments": confirmed_texts})
                 # 有文本时才开启会话
                 if not self.activate_session:
                     await self.start_session(self.conn.sentence_id)
@@ -261,7 +289,11 @@ class TTSProvider(TTSProviderBase):
                     if self.ws:
                         # 发送文本合成请求
                         run_request = self._build_base_request(status=1, text=txt)
+                        send_started = time.monotonic()
                         await self.ws.send(json.dumps(run_request))
+                        if trace:
+                            trace.observe("tts.text_send", time.monotonic() - send_started)
+                            trace.mark("tts.first_text_sent", once=True)
             return
 
         except Exception as e:
@@ -287,7 +319,7 @@ class TTSProvider(TTSProviderBase):
             # 启动监听任务
             if self._monitor_task is None or self._monitor_task.done():
                 logger.bind(tag=TAG).debug("启动监听任务...")
-                self._monitor_task = asyncio.create_task(self._start_monitor_tts_response())
+                self._monitor_task = asyncio.create_task(self._start_monitor_tts_response(self._diagnostic_trace))
 
             # 连接就绪后再标记会话激活，避免旧监听任务退出时重置标志
             self.activate_session = True
@@ -347,12 +379,16 @@ class TTSProvider(TTSProviderBase):
                 pass
             self.ws = None
 
-    async def _start_monitor_tts_response(self):
+    async def _start_monitor_tts_response(self, trace=None):
         """监听TTS响应"""
+        completed = False
+        sentence_id = self.current_sentence_id
         try:
             while not self.conn.stop_event.is_set():
                 try:
                     msg = await self.ws.recv()
+                    if trace:
+                        trace.mark("tts.first_event", once=True)
 
                     # 检查客户端是否中止
                     if self.conn.client_abort:
@@ -374,9 +410,15 @@ class TTSProvider(TTSProviderBase):
                                 if status == 0:
                                     logger.bind(tag=TAG).debug("TTS合成已启动")
                                     self.tts_audio_queue.put(
-                                        (SentenceType.FIRST, [], None)
+                                        (SentenceType.FIRST, [], None, sentence_id)
                                     )
                                 elif status == 2:
+                                    completed = True
+                                    if trace:
+                                        trace.mark("tts.synthesis_end")
+                                        started = trace.events.get("tts.first_text_ready")
+                                        if started is not None:
+                                            trace.observe("tts.total", time.monotonic() - started)
                                     logger.bind(tag=TAG).debug("收到结束状态的音频数据，TTS合成完成")
                                     self.activate_session = False
                                     self._process_before_stop_play_files()
@@ -388,24 +430,37 @@ class TTSProvider(TTSProviderBase):
                                             f"句子语音生成成功： {tts_text}"
                                         )
                                         self.tts_audio_queue.put(
-                                            (SentenceType.FIRST, [], tts_text)
+                                            (SentenceType.FIRST, [], tts_text, sentence_id)
                                         )
                                         self.clear_tts_text(self.conn.sentence_id)
                                     try:
                                         audio_bytes = base64.b64decode(audio_data)
+                                        if trace and audio_bytes:
+                                            trace.mark("tts.first_audio", once=True)
+                                        encode_started = time.monotonic()
                                         self.opus_encoder.encode_pcm_to_opus_stream(
-                                            audio_bytes, False, self.handle_opus
+                                            audio_bytes, False,
+                                            lambda opus: self.tts_audio_queue.put((SentenceType.MIDDLE, opus, None, sentence_id))
                                         )
+                                        if trace:
+                                            trace.observe("audio.encode", time.monotonic() - encode_started)
 
                                     except Exception as e:
+                                        if trace:
+                                            trace.error("audio.encode", e)
                                         logger.bind(tag=TAG).error(f"处理音频数据失败: {e}")
 
                         else:
                             message = header.get("message", "未知错误")
                             logger.bind(tag=TAG).error(f"TTS合成错误: {code} - {message}")
+                            if trace:
+                                trace.mark("tts.provider_error", code=code)
+                                trace.error("tts.provider", RuntimeError())
                             break
 
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as exc:
+                        if trace:
+                            trace.error("tts.response_parse", exc)
                         logger.bind(tag=TAG).warning("收到无效的JSON消息")
 
                 except websockets.ConnectionClosed:
@@ -413,6 +468,8 @@ class TTSProvider(TTSProviderBase):
                     break
 
                 except Exception as e:
+                    if trace:
+                        trace.error("tts.receive", e)
                     logger.bind(tag=TAG).error(
                         f"处理TTS响应时出错: {e}\n{traceback.format_exc()}"
                     )
@@ -420,6 +477,8 @@ class TTSProvider(TTSProviderBase):
 
         # 监听任务退出时关闭连接并清理引用
         finally:
+            if trace and not completed:
+                trace.finish("aborted" if self.conn.client_abort else "tts_incomplete")
             if self.ws:
                 try:
                     await self.ws.close()

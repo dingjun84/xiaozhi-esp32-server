@@ -1,3 +1,4 @@
+from core.utils.latency import TimedQueue, trace_for, current_trace
 import os
 import re
 import math
@@ -5,6 +6,7 @@ import uuid
 import queue
 import asyncio
 import threading
+import time
 import traceback
 
 from core.utils import p3
@@ -40,8 +42,8 @@ class TTSProviderBase(ABC):
         self.tts_timeout = float(config.get("tts_timeout", 15))
         if not math.isfinite(self.tts_timeout) or self.tts_timeout <= 0:
             raise ValueError("tts_timeout must be a positive finite number")
-        self.tts_text_queue = queue.Queue()
-        self.tts_audio_queue = queue.Queue()
+        self.tts_text_queue = TimedQueue(self._observe_text_queue, self._bind_text_trace)
+        self.tts_audio_queue = TimedQueue(self._observe_audio_queue, self._bind_audio_trace)
         self.tts_audio_first_sentence = True
         self.before_stop_play_files = []
         self.report_on_last = False
@@ -108,6 +110,33 @@ class TTSProviderBase(ABC):
         self.tts_stop_request = False
         self.processed_chars = 0
         self.is_first_sentence = True
+
+    def _bind_trace(self, sentence_id):
+        trace = current_trace.get()
+        if trace and self.conn and sentence_id:
+            # Some legacy intent handlers allocate their own sentence id.
+            self.conn._turn_traces[sentence_id] = trace
+            trace.mark("tts.enqueued", once=True, sentence_id=sentence_id)
+
+    def _bind_text_trace(self, item):
+        self._bind_trace(getattr(item, "sentence_id", None))
+
+    def _bind_audio_trace(self, item):
+        if len(item) == 4:
+            self._bind_trace(item[3])
+
+    def _observe_text_queue(self, item, elapsed):
+        conn = getattr(self, "conn", None)
+        trace = trace_for(conn, getattr(item, "sentence_id", None)) if conn else None
+        if trace:
+            trace.observe("tts.text_queue", elapsed)
+
+    def _observe_audio_queue(self, item, elapsed):
+        conn = getattr(self, "conn", None)
+        sentence_id = item[3] if len(item) == 4 else getattr(self, "current_sentence_id", None)
+        trace = trace_for(conn, sentence_id) if conn else None
+        if trace:
+            trace.observe("tts.audio_queue", elapsed)
 
     def generate_filename(self, extension=".wav"):
         return os.path.join(
@@ -410,6 +439,12 @@ class TTSProviderBase(ABC):
                 )
                 continue
 
+    async def _dispatch_audio_traced(self, sentence_type, audio_datas, text, sentence_id, submitted):
+        trace = trace_for(self.conn, sentence_id)
+        if trace:
+            trace.observe("audio.loop_dispatch", time.monotonic() - submitted)
+        await sendAudioMessage(self.conn, sentence_type, audio_datas, text, sentence_id)
+
     def _audio_play_priority_thread(self):
         # 需要上报的文本和音频列表
         enqueue_text = None
@@ -458,7 +493,7 @@ class TTSProviderBase(ABC):
 
                 # 发送音频
                 future = asyncio.run_coroutine_threadsafe(
-                    sendAudioMessage(self.conn, sentence_type, audio_datas, text, sentence_id),
+                    self._dispatch_audio_traced(sentence_type, audio_datas, text, sentence_id, time.monotonic()),
                     self.conn.loop,
                 )
                 future.result()

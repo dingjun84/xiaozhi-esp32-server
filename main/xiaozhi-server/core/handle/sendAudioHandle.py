@@ -1,3 +1,4 @@
+from core.utils.latency import trace_for
 import json
 import time
 import asyncio
@@ -191,6 +192,10 @@ def _get_or_create_rate_controller(
         else:
             conn.audio_rate_controller.reset()
 
+        trace = trace_for(conn)
+        conn.audio_rate_controller.queue_observer = (
+            (lambda elapsed: trace.observe("audio.pacing_queue", elapsed)) if trace else None
+        )
         # 初始化 flow_control
         conn.audio_flow_control = {
             "packet_count": 0,
@@ -262,9 +267,29 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
     """
     执行实际的音频发送
     """
+    trace = trace_for(conn, flow_control.get("sentence_id"))
+    send_started = time.monotonic()
     packet_index = flow_control.get("packet_count", 0)
     sequence = flow_control.get("sequence", 0)
 
+    try:
+        await _send_packet(conn, opus_packet, sequence)
+    except Exception as exc:
+        if trace:
+            trace.error("audio.send", exc)
+            trace.finish("send_error")
+        raise
+
+    if trace:
+        trace.observe("audio.websocket_send", time.monotonic() - send_started)
+        trace.mark("audio.first_sent", once=True)
+        with trace.lock:
+            trace.events["audio.last_sent"] = time.monotonic()
+    flow_control["packet_count"] = packet_index + 1
+    flow_control["sequence"] = sequence + 1
+
+
+async def _send_packet(conn, opus_packet, sequence):
     if conn.conn_from_mqtt_gateway:
         # 计算时间戳（基于播放位置）
         start_time = time.time()
@@ -273,10 +298,6 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
     else:
         # 直接发送opus数据包
         await conn.websocket.send(opus_packet)
-
-    # 更新流控状态
-    flow_control["packet_count"] = packet_index + 1
-    flow_control["sequence"] = sequence + 1
 
 
 async def send_tts_message(conn: "ConnectionHandler", state, text=None):
@@ -287,6 +308,7 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
     if text is not None:
         message["text"] = textUtils.check_emoji(text)
 
+    trace = trace_for(conn)
     # TTS播放结束
     if state == "stop":
         # 保存当前的 sentence_id，用于后续判断是否是当前轮次
@@ -300,7 +322,11 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
             audios = await audio_to_data(stop_tts_notify_voice, is_opus=True)
             await sendAudio(conn, audios)
         # 等待所有音频包发送完成
-        await _wait_for_audio_completion(conn)
+        if trace:
+            with trace.span("audio.drain"):
+                await _wait_for_audio_completion(conn)
+        else:
+            await _wait_for_audio_completion(conn)
 
         # 检查是否是当前轮次
         if current_sentence_id != conn.sentence_id:
@@ -313,6 +339,9 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
 
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))
+    if state == "stop" and trace:
+        trace.mark("audio.stop_sent")
+        trace.finish("completed_with_errors" if trace.errors else "completed")
 
 
 async def send_stt_message(conn: "ConnectionHandler", text):

@@ -1,3 +1,4 @@
+from core.utils.latency import timed_await
 import os
 import io
 import wave
@@ -85,6 +86,9 @@ class ASRProviderBase(ABC):
         """并行处理ASR和声纹识别"""
         try:
             total_start_time = time.monotonic()
+            trace = getattr(conn, "_input_trace", None)
+            if trace:
+                trace.mark("asr.postprocess.start")
 
             # 数据已经是PCM直接使用
             pcm_data = asr_audio_task
@@ -96,14 +100,14 @@ class ASRProviderBase(ABC):
                 wav_data = self._pcm_to_wav(combined_pcm_data)
 
             # 定义ASR任务
-            asr_task = self.speech_to_text_wrapper(
+            asr_task = timed_await(trace, "asr.result_extract", self.speech_to_text_wrapper(
                 asr_audio_task, conn.session_id
-            )
+            ))
 
             if conn.voiceprint_provider and wav_data:
-                voiceprint_task = conn.voiceprint_provider.identify_speaker(
+                voiceprint_task = timed_await(trace, "voiceprint.identify", conn.voiceprint_provider.identify_speaker(
                     wav_data, conn.session_id
-                )
+                ))
                 # 并发等待两个结果
                 asr_result, voiceprint_result = await asyncio.gather(
                     asr_task, voiceprint_task, return_exceptions=True
@@ -159,6 +163,10 @@ class ASRProviderBase(ABC):
             total_time = time.monotonic() - total_start_time
             logger.bind(tag=TAG).debug(f"总处理耗时: {total_time:.3f}s")
 
+            if trace:
+                trace.observe("asr.postprocess", time.monotonic() - total_start_time)
+                trace.mark("asr.postprocess.end")
+                trace.io("asr.output", raw_text)
             # 检查文本长度
             text_len, _ = remove_punctuation_and_length(content_for_length_check)
             self.stop_ws_connection()
@@ -167,8 +175,14 @@ class ASRProviderBase(ABC):
                 audio_snapshot = asr_audio_task.copy()
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
                 # 使用自定义模块进行上报
-                await startToChat(conn, enhanced_text)
+                await startToChat(conn, enhanced_text, trace=trace)
+            elif trace:
+                trace.finish("empty_asr")
         except Exception as e:
+            trace = getattr(conn, "_input_trace", None)
+            if trace:
+                trace.error("asr.postprocess", e)
+                trace.finish("error")
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")
             import traceback
 

@@ -45,6 +45,11 @@ server:
   mqtt_signature_key: null
   # UDP网关配置
   udp_gateway: null
+# 全链路诊断：独立于 DEBUG 等级；模型文本按需开启（可能包含完整对话）。
+diagnostics:
+  enabled: true
+  model_io: false
+
 log:
   # 设置控制台输出的日志格式，时间、日志级别、标签、消息
   log_format: "<green>{time:YYMMDD HH:mm:ss}</green>[{version}_{selected_module}][<light-blue>{extra[tag]}</light-blue>]-<level>{level}</level>-<light-green>{message}</light-green>"

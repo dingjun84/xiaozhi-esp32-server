@@ -1,3 +1,4 @@
+from core.utils.latency import new_trace, current_trace
 import time
 import json
 import asyncio
@@ -16,7 +17,9 @@ TAG = __name__
 
 async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
     # 当前片段是否有人说话
+    vad_started = time.monotonic()
     have_voice = conn.vad.is_vad(conn, pcm_frame)
+    vad_elapsed = time.monotonic() - vad_started
     # 如果设备刚刚被唤醒，短暂忽略VAD检测
     if hasattr(conn, "just_woken_up") and conn.just_woken_up:
         have_voice = False
@@ -24,6 +27,23 @@ async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
         if not hasattr(conn, "vad_resume_task") or conn.vad_resume_task.done():
             conn.vad_resume_task = asyncio.create_task(resume_vad_detection(conn))
         return
+    trace = getattr(conn, "_input_trace", None)
+    if have_voice and (trace is None or trace.finished):
+        received = getattr(conn, "_audio_received_at", time.monotonic())
+        trace = new_trace(conn, "audio", started=received)
+        conn._input_trace = trace
+        trace.mark("audio.first_received", at=received)
+        trace.mark("voice.first", at=received)
+        trace.observe("audio.input_queue", getattr(conn, "_audio_queue_wait", 0))
+        trace.observe("audio.decode", getattr(conn, "_last_decode_elapsed", 0))
+    if trace and not trace.finished:
+        trace.observe("vad.inference", vad_elapsed)
+        if have_voice:
+            # High-frequency marker: retained for summary, not printed every frame.
+            with trace.lock:
+                trace.events["voice.last"] = getattr(conn, "_audio_received_at", time.monotonic())
+        if conn.client_voice_stop:
+            trace.mark("vad.stop", once=True)
     # 服务端AEC功能需要实时触发打断
     if conn.client_aec and have_voice:
         if conn.client_is_speaking and conn.client_listen_mode != "manual":
@@ -40,7 +60,10 @@ async def resume_vad_detection(conn: "ConnectionHandler"):
     conn.just_woken_up = False
 
 
-async def startToChat(conn: "ConnectionHandler", text):
+async def startToChat(conn: "ConnectionHandler", text, trace=None):
+    trace = trace or new_trace(conn, "text")
+    trace.mark("chat.input_ready")
+    trace.io("chat.input", text)
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     actual_text = text
@@ -77,6 +100,7 @@ async def startToChat(conn: "ConnectionHandler", text):
 
     if conn.need_bind:
         await check_bind_device(conn)
+        trace.finish("binding_required")
         return
 
     # 如果当日的输出字数大于限定的字数
@@ -85,6 +109,7 @@ async def startToChat(conn: "ConnectionHandler", text):
             conn.headers.get("device-id"), conn.max_output_size
         ):
             await max_out_size(conn)
+            trace.finish("output_limit")
             return
 
     # manual 模式下不打断正在播放的内容
@@ -92,10 +117,17 @@ async def startToChat(conn: "ConnectionHandler", text):
         await handleAbortMessage(conn)
 
     # 首先进行意图分析，使用实际文本内容
-    intent_handled = await handle_user_intent(conn, actual_text)
+    token = current_trace.set(trace)
+    try:
+        with trace.span("intent"):
+            intent_handled = await handle_user_intent(conn, actual_text)
+    finally:
+        current_trace.reset(token)
 
     if intent_handled:
-        # 如果意图已被处理，不再进行聊天
+        # Audio-producing intent paths finish at the same audio stop boundary.
+        if "tts.enqueued" not in trace.events:
+            trace.finish("intent_handled")
         return
 
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
@@ -104,7 +136,8 @@ async def startToChat(conn: "ConnectionHandler", text):
     # 准备开始新会话
     conn.client_abort = False
 
-    conn.executor.submit(conn.chat, actual_text)
+    trace.mark("chat.queued")
+    conn.executor.submit(conn.chat, actual_text, trace=trace)
 
 
 async def no_voice_close_connect(conn: "ConnectionHandler", have_voice):

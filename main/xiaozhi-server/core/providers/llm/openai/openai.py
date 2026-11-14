@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+from core.utils.latency import current_trace, current_request
 import httpx
 import openai
 from openai.types import CompletionUsage
@@ -141,11 +143,18 @@ class LLMProvider(LLMProviderBase):
         # 禁用思考模式
         self._apply_thinking_disabled(request_params)
 
-        responses = self.client.chat.completions.create(**request_params)
+        trace = current_trace.get()
+        if trace:
+            trace.io("llm.sdk_request", request_params)
+        stage = f"llm.{current_request.get() or 1}"
+        with trace.span(stage + ".http_open") if trace else nullcontext():
+            responses = self.client.chat.completions.create(**request_params)
 
         is_active = True
         try:            
             for chunk in responses:
+                if trace:
+                    trace.mark(stage + ".first_event", once=True)
                 try:
                     delta = chunk.choices[0].delta if getattr(chunk, "choices", None) else None
                     content = getattr(delta, "content", "") if delta else ""
@@ -187,10 +196,17 @@ class LLMProvider(LLMProviderBase):
         # 禁用思考模式
         self._apply_thinking_disabled(request_params)
 
-        stream = self.client.chat.completions.create(**request_params)
+        trace = current_trace.get()
+        if trace:
+            trace.io("llm.sdk_request", request_params)
+        stage = f"llm.{current_request.get() or 1}"
+        with trace.span(stage + ".http_open") if trace else nullcontext():
+            stream = self.client.chat.completions.create(**request_params)
 
         try:
             for chunk in stream:
+                if trace:
+                    trace.mark(stage + ".first_event", once=True)
                 if getattr(chunk, "choices", None):
                     delta = chunk.choices[0].delta
                     content = getattr(delta, "content", "")

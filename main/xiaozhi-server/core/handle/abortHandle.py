@@ -1,3 +1,4 @@
+from core.utils.latency import trace_for
 import json
 from typing import TYPE_CHECKING
 
@@ -7,6 +8,9 @@ TAG = __name__
 
 
 async def handleAbortMessage(conn: "ConnectionHandler"):
+    trace = trace_for(conn)
+    if trace:
+        trace.finish("aborted")
     conn.logger.bind(tag=TAG).info("Abort message received")
     # 设置成打断状态，会自动打断llm、tts任务
     conn.close_after_chat = False
